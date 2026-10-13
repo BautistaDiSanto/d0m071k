@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://dfcce2qsi7p3n"]
+
+[ext_resource type="Script" uid="uid://btscwt56etww3" path="res://main.gd" id="1"]
+
+[node name="Main" type="MarginContainer" unique_id=2001306518]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+script = ExtResource("1")
