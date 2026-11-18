@@ -1,8 +1,9 @@
 extends MarginContainer
 ## Desktop control for Tuya bulbs over the local network. No cloud, no helper programs:
 ## bulbs are listed in lights.cfg and found on the network automatically.
-## Each bulb gets a collapsible section with a COLOR tab (hue bar + brightness)
-## and a WARM tab (warm-to-cool white + brightness).
+## Each bulb gets a collapsible section with a COLOR tab (hue bar + brightness),
+## a WARM tab (warm-to-cool white + brightness) and a SYNC tab, where the bulb
+## follows the average colour of the screen (for films and games).
 
 const Tuya := preload("res://tuya.gd")
 ## Packed into the .exe on export (the export preset's include filter lists it).
@@ -14,12 +15,25 @@ const BG_TOP := Color("#26222e")
 const BG_BOTTOM := Color("#141218")
 ## Notification-area icon: the glowing bulb, at tray size.
 const TRAY_ICON := preload("res://tray.png")
+## Screen sync: screen readings per second, and the grid of pixels averaged from each.
+const SYNC_HZ := 8.0
+const SYNC_GRID := Vector2i(48, 27)
+## How much more saturated the bulb is than the screen's average, so it doesn't come out grey.
+const SYNC_SATURATION := 1.75
+## Only one copy of the app runs at a time: the first one holds this local port,
+## and a later one asks it to show its window, then quits.
+const INSTANCE_PORT := 47301
+const INSTANCE_HELLO := "D0m071k:here"
 
 var bulbs: Array[Dictionary] = []  # {name, id, key, ip, version, device, ui, ...}
 var list := VBoxContainer.new()
 var status := Label.new()
 var scan_prefixes: Array = []  # networks to scan; empty means this computer's own
-var tray: StatusIndicator  # null when the app quits on close (not Windows, or run inside the editor)
+var tray: StatusIndicator  # null when the app quits on close (not Windows, or run from the editor)
+var sync_timer := Timer.new()  # runs while any bulb follows the screen
+var sync_report_at := 0  # when the sync status line was last refreshed (ms)
+var instance_server: TCPServer  # null when running inside the editor
+var instance_peers: Array[StreamPeerTCP] = []  # later copies asking us to show
 
 
 ## A horizontal colour strip you click or drag along; value runs 0 to 1.
@@ -91,10 +105,16 @@ func _draw() -> void:
 
 
 func _ready() -> void:
+	if not _claim_single_instance():
+		get_tree().quit()
+		return
 	for side in ["left", "right", "top", "bottom"]:
 		add_theme_constant_override("margin_" + side, 16)
 	_build_ui()
 	_setup_tray()
+	sync_timer.wait_time = 1.0 / SYNC_HZ
+	sync_timer.timeout.connect(_sync_tick)
+	add_child(sync_timer)
 	_load_config()
 	if bulbs.is_empty():
 		status.text = "Add your bulb's id and local_key to lights.cfg in the project folder, then restart."
@@ -104,11 +124,58 @@ func _ready() -> void:
 	await _find_bulbs()
 
 
+## Holds the instance port, or, if another copy already holds it, asks that copy
+## to show its window and returns false. Skipped when run from the editor.
+func _claim_single_instance() -> bool:
+	if OS.has_feature("editor"):
+		return true
+	instance_server = TCPServer.new()
+	if instance_server.listen(INSTANCE_PORT, "127.0.0.1") == OK:
+		return true
+	instance_server = null
+	# Port taken. Only give up if it's really this app answering (not some other program).
+	var peer := StreamPeerTCP.new()
+	if peer.connect_to_host("127.0.0.1", INSTANCE_PORT) != OK:
+		return true
+	var reply := ""
+	var deadline := Time.get_ticks_msec() + 1500
+	while Time.get_ticks_msec() < deadline:
+		peer.poll()
+		var st := peer.get_status()
+		if st == StreamPeerTCP.STATUS_ERROR or st == StreamPeerTCP.STATUS_NONE:
+			break
+		if st == StreamPeerTCP.STATUS_CONNECTED and peer.get_available_bytes() > 0:
+			reply += peer.get_utf8_string(peer.get_available_bytes())
+			if reply.begins_with(INSTANCE_HELLO):
+				peer.disconnect_from_host()
+				return false
+		OS.delay_msec(10)
+	peer.disconnect_from_host()
+	return true
+
+
+## A later copy of the app connected: say who we are and bring the window back.
+func _process(_delta: float) -> void:
+	if instance_server == null:
+		return
+	while instance_server.is_connection_available():
+		var peer := instance_server.take_connection()
+		peer.put_data(INSTANCE_HELLO.to_utf8_buffer())
+		instance_peers.append(peer)
+		_show_window()
+	for peer in instance_peers.duplicate():
+		peer.poll()
+		if peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			instance_peers.erase(peer)
+
+
 ## Puts the app in the notification area (next to the clock). Closing the window
 ## then only hides it: clicking the icon brings it back, right-clicking it
 ## offers Show and Quit.
 func _setup_tray() -> void:
-	if OS.get_name() != "Windows" or Engine.is_embedded_in_editor() \
+	# Not when run from the editor: its Stop button kills the app outright, which
+	# leaves a dead icon behind in the tray every time.
+	if OS.get_name() != "Windows" or OS.has_feature("editor") \
 			or not DisplayServer.has_feature(DisplayServer.FEATURE_STATUS_INDICATOR):
 		return
 	get_tree().set_auto_accept_quit(false)
@@ -134,7 +201,17 @@ func _on_tray_menu(id: int) -> void:
 	if id == 0:
 		_show_window()
 	else:
-		get_tree().quit()
+		_quit()
+
+
+## Takes the icon out of the tray before quitting, so none is left behind.
+func _quit() -> void:
+	if tray:
+		tray.visible = false
+		tray.queue_free()
+		tray = null
+		await get_tree().process_frame
+	get_tree().quit()
 
 
 func _notification(what: int) -> void:
@@ -188,13 +265,19 @@ func _box_style(bg: Color, radius: int) -> StyleBoxFlat:
 	return s
 
 
-## One dropdown section: header (name, on/off, arrow) and a body with the two tabs.
+## One dropdown section: header (name, on/off, arrow) and a body with the three tabs.
 func _build_bulb(b: Dictionary, open: bool) -> void:
 	var ui := {}
 	b.ui = ui
 	b.mode = "colour"
 	b.sending = false
 	b.queued = {}
+	b.sync = false
+	b.sent = 0  # commands the bulb accepted, and how long the last one took
+	b.sent_ms = 0
+	b.sent_mark = 0
+	b.sync_last = Vector3i.ZERO
+	b.sync_fresh = true
 	var section := VBoxContainer.new()
 	section.add_theme_constant_override("separation", 0)
 	list.add_child(section)
@@ -223,7 +306,10 @@ func _build_bulb(b: Dictionary, open: bool) -> void:
 	ui.power = CheckButton.new()
 	ui.power.focus_mode = Control.FOCUS_NONE
 	ui.power.tooltip_text = "On / off"
-	ui.power.toggled.connect(func(on): _send(b, {"20": on}))
+	ui.power.toggled.connect(func(on):
+		if not on:
+			_set_sync(b, false)
+		_send(b, {"20": on}))
 	row.add_child(ui.power)
 	ui.arrow = Chevron.new()
 	row.add_child(ui.arrow)
@@ -253,7 +339,7 @@ func _build_bulb(b: Dictionary, open: bool) -> void:
 	var pages := []
 	ui.tab_buttons = []
 	var underlines := []
-	for title in ["COLOR", "WARM"]:
+	for title in ["COLOR", "WARM", "SYNC"]:
 		var tab := VBoxContainer.new()
 		tab.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		tab.add_theme_constant_override("separation", 2)
@@ -300,11 +386,34 @@ func _build_bulb(b: Dictionary, open: bool) -> void:
 	pages[1].add_child(ui.warmth)
 	ui.white_level = _brightness(pages[1], func(): _send_white(b))
 
-	for i in 2:
+	# SYNC page: on/off, smoothness, brightness
+	var sync_row := HBoxContainer.new()
+	var sync_title := Label.new()
+	sync_title.text = "Match the screen"
+	sync_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sync_row.add_child(sync_title)
+	ui.sync = CheckButton.new()
+	ui.sync.focus_mode = Control.FOCUS_NONE
+	ui.sync.toggled.connect(func(on): _set_sync(b, on))
+	sync_row.add_child(ui.sync)
+	pages[2].add_child(sync_row)
+	ui.sync_tint = underlines[2]
+	ui.sync_tint.color = Color.WHITE
+	ui.smoothness = _brightness(pages[2], func(): pass, "Smoothness", 50, 0)
+	ui.sync_level = _brightness(pages[2], func(): pass, "Brightness")
+	var hint := Label.new()
+	hint.text = "Keeps going while the app is in the tray. Games in exclusive fullscreen and some streaming apps look black to it: use borderless or windowed."
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD
+	hint.modulate = Color(1, 1, 1, 0.5)
+	hint.add_theme_font_size_override("font_size", 13)
+	pages[2].add_child(hint)
+
+	for i in 3:
 		ui.tab_buttons[i].toggled.connect(func(on):
 			pages[i].visible = on
-			if not on or ui.get("syncing", false):
+			if not on or ui.get("syncing", false) or i == 2:
 				return
+			_set_sync(b, false)
 			if i == 0:
 				_send_colour(b)
 			else:
@@ -312,24 +421,25 @@ func _build_bulb(b: Dictionary, open: bool) -> void:
 	ui.syncing = true
 	ui.tab_buttons[0].button_pressed = true
 	pages[1].visible = false
+	pages[2].visible = false
 	ui.syncing = false
 
 
-## "Brightness", a slider and its percentage underneath. Returns the slider.
-func _brightness(page: VBoxContainer, on_change: Callable) -> HSlider:
+## "Brightness" (or another title), a slider and its percentage underneath. Returns the slider.
+func _brightness(page: VBoxContainer, on_change: Callable, heading := "Brightness", start := 100, lowest := 1) -> HSlider:
 	var title := Label.new()
-	title.text = "Brightness"
+	title.text = heading
 	page.add_child(title)
 	var slider := HSlider.new()
-	slider.min_value = 1
+	slider.min_value = lowest
 	slider.max_value = 100
-	slider.value = 100
+	slider.value = start
 	slider.custom_minimum_size.y = 24
 	page.add_child(slider)
 	var pct := Label.new()
 	pct.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	pct.add_theme_font_size_override("font_size", 18)
-	pct.text = "100 %"
+	pct.text = "%d %%" % start
 	page.add_child(pct)
 	slider.value_changed.connect(func(v):
 		pct.text = "%d %%" % int(v)
@@ -546,8 +656,15 @@ func _send(b: Dictionary, dps: Dictionary) -> void:
 	while not b.queued.is_empty():
 		var next: Dictionary = b.queued
 		b.queued = {}
+		var started := Time.get_ticks_msec()
 		var err: String = await b.device.set_dps(next)
-		status.text = "%s: %s" % [b.name, err] if err else ""
+		if err:
+			status.text = "%s: %s" % [b.name, err]
+		else:
+			b.sent += 1
+			b.sent_ms = Time.get_ticks_msec() - started
+			if not b.sync:
+				status.text = ""
 	b.sending = false
 
 
@@ -562,3 +679,101 @@ func _send_colour(b: Dictionary) -> void:
 	var hue := int(b.ui.hue.value * 360) % 360
 	var level: int = max(10, int(b.ui.colour_level.value * 10))
 	await _send(b, {"20": true, "21": "colour", "24": "%04x%04x%04x" % [hue, 1000, level]})
+
+
+# --- screen sync --------------------------------------------------------------
+
+func _set_sync(b: Dictionary, on: bool) -> void:
+	b.ui.sync.set_pressed_no_signal(on)
+	if on == b.sync:
+		return
+	b.sync = on
+	b.sync_fresh = true  # start from the next reading, not from where it was last time
+	b.sent_mark = b.sent
+	if on:
+		b.ui.power.set_pressed_no_signal(true)
+	var any := bulbs.any(func(x): return x.get("sync", false))
+	if any and sync_timer.is_stopped():
+		sync_report_at = Time.get_ticks_msec()
+		sync_timer.start()
+	elif not any:
+		sync_timer.stop()
+		status.text = ""
+
+
+## Reads the screen, then moves every syncing bulb towards its colour.
+func _sync_tick() -> void:
+	var img := DisplayServer.screen_get_image(DisplayServer.get_primary_screen())
+	if img == null or img.is_empty():
+		for b in bulbs:
+			_set_sync(b, false)
+		status.text = "This computer doesn't let the app read the screen."
+		return
+	var reading := _screen_colour(img)
+	for b in bulbs:
+		if b.sync and b.device != null:
+			_sync_bulb(b, reading[0], reading[1])
+	var now := Time.get_ticks_msec()
+	if now - sync_report_at >= 1000:
+		var parts := []
+		for b in bulbs:
+			if b.sync:
+				var rate: float = (b.sent - b.sent_mark) * 1000.0 / (now - sync_report_at)
+				parts.append("%s: %.1f changes/s, %d ms per command" % [b.name, rate, b.sent_ms])
+				b.sent_mark = b.sent
+		status.text = "Matching the screen: " + ", ".join(parts)
+		sync_report_at = now
+
+
+## The screen's colour at full value, and its brightness 0 to 1. Averages a grid of
+## pixels instead of the whole image. Colourful pixels count for much more than
+## grey or pale ones, so the light leans towards the strongest colour on screen
+## (a bright sign on a dark street still tints the room), and the result is made
+## a little more saturated than the average.
+func _screen_colour(img: Image) -> Array:
+	var w := img.get_width()
+	var h := img.get_height()
+	var sum := Color(0, 0, 0, 0)
+	var weights := 0.0
+	var brightness := 0.0
+	for gy in SYNC_GRID.y:
+		var y := int((gy + 0.5) * h / SYNC_GRID.y)
+		for gx in SYNC_GRID.x:
+			var c := img.get_pixel(int((gx + 0.5) * w / SYNC_GRID.x), y)
+			var hi := maxf(c.r, maxf(c.g, c.b))
+			var chroma := hi - minf(c.r, minf(c.g, c.b))
+			var weight := 0.03 + 4.0 * chroma * chroma
+			sum += c * weight
+			weights += weight
+			brightness += hi
+	var avg := sum / weights
+	var colour := Color.from_hsv(avg.h, minf(1.0, avg.s * SYNC_SATURATION), 1.0)
+	return [colour, brightness / (SYNC_GRID.x * SYNC_GRID.y)]
+
+
+## Eases the bulb towards the screen (more smoothness, slower) and sends only
+## when the change is big enough to see. A command goes out only after the last
+## one has landed (see _send), so the bulb is never flooded.
+func _sync_bulb(b: Dictionary, colour: Color, level: float) -> void:
+	var share := lerpf(1.0, 0.05, sqrt(b.ui.smoothness.value / 100.0))
+	var dps := {}
+	if b.sync_fresh:
+		b.sync_fresh = false
+		b.sync_colour = colour
+		b.sync_level = level
+		dps = {"20": true, "21": "colour"}
+	else:
+		b.sync_colour = (b.sync_colour as Color).lerp(colour, share)
+		b.sync_level = lerpf(b.sync_level, level, share)
+	var c: Color = b.sync_colour
+	b.ui.sync_tint.color = c
+	# a dark scene dims the bulb but doesn't put it out
+	var value: float = (0.1 + 0.9 * sqrt(b.sync_level)) * b.ui.sync_level.value / 100.0
+	var now := Vector3i(int(c.h * 360) % 360, int(c.s * 1000), maxi(10, int(value * 1000)))
+	var last: Vector3i = b.sync_last
+	var hue_step := absi(now.x - last.x)
+	if dps.is_empty() and mini(hue_step, 360 - hue_step) < 3 and absi(now.y - last.y) < 20 and absi(now.z - last.z) < 15:
+		return
+	b.sync_last = now
+	dps["24"] = "%04x%04x%04x" % [now.x, now.y, now.z]
+	_send(b, dps)
