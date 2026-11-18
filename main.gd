@@ -14,12 +14,18 @@ const BG_TOP := Color("#26222e")
 const BG_BOTTOM := Color("#141218")
 ## Notification-area icon: the glowing bulb, at tray size.
 const TRAY_ICON := preload("res://tray.png")
+## Only one copy of the app runs at a time: the first one holds this local port,
+## and a later one asks it to show its window, then quits.
+const INSTANCE_PORT := 47301
+const INSTANCE_HELLO := "D0m071k:here"
 
 var bulbs: Array[Dictionary] = []  # {name, id, key, ip, version, device, ui, ...}
 var list := VBoxContainer.new()
 var status := Label.new()
 var scan_prefixes: Array = []  # networks to scan; empty means this computer's own
 var tray: StatusIndicator  # null when the app quits on close (not Windows, or run inside the editor)
+var instance_server: TCPServer  # null when running inside the editor
+var instance_peers: Array[StreamPeerTCP] = []  # later copies asking us to show
 
 
 ## A horizontal colour strip you click or drag along; value runs 0 to 1.
@@ -91,6 +97,9 @@ func _draw() -> void:
 
 
 func _ready() -> void:
+	if not _claim_single_instance():
+		get_tree().quit()
+		return
 	for side in ["left", "right", "top", "bottom"]:
 		add_theme_constant_override("margin_" + side, 16)
 	_build_ui()
@@ -102,6 +111,51 @@ func _ready() -> void:
 	for i in bulbs.size():
 		_build_bulb(bulbs[i], i == 0)
 	await _find_bulbs()
+
+
+## Holds the instance port, or, if another copy already holds it, asks that copy
+## to show its window and returns false. Skipped when run from the editor.
+func _claim_single_instance() -> bool:
+	if OS.has_feature("editor"):
+		return true
+	instance_server = TCPServer.new()
+	if instance_server.listen(INSTANCE_PORT, "127.0.0.1") == OK:
+		return true
+	instance_server = null
+	# Port taken. Only give up if it's really this app answering (not some other program).
+	var peer := StreamPeerTCP.new()
+	if peer.connect_to_host("127.0.0.1", INSTANCE_PORT) != OK:
+		return true
+	var reply := ""
+	var deadline := Time.get_ticks_msec() + 1500
+	while Time.get_ticks_msec() < deadline:
+		peer.poll()
+		var st := peer.get_status()
+		if st == StreamPeerTCP.STATUS_ERROR or st == StreamPeerTCP.STATUS_NONE:
+			break
+		if st == StreamPeerTCP.STATUS_CONNECTED and peer.get_available_bytes() > 0:
+			reply += peer.get_utf8_string(peer.get_available_bytes())
+			if reply.begins_with(INSTANCE_HELLO):
+				peer.disconnect_from_host()
+				return false
+		OS.delay_msec(10)
+	peer.disconnect_from_host()
+	return true
+
+
+## A later copy of the app connected: say who we are and bring the window back.
+func _process(_delta: float) -> void:
+	if instance_server == null:
+		return
+	while instance_server.is_connection_available():
+		var peer := instance_server.take_connection()
+		peer.put_data(INSTANCE_HELLO.to_utf8_buffer())
+		instance_peers.append(peer)
+		_show_window()
+	for peer in instance_peers.duplicate():
+		peer.poll()
+		if peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			instance_peers.erase(peer)
 
 
 ## Puts the app in the notification area (next to the clock). Closing the window
