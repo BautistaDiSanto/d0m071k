@@ -23,7 +23,7 @@ var bulbs: Array[Dictionary] = []  # {name, id, key, ip, version, device, ui, ..
 var list := VBoxContainer.new()
 var status := Label.new()
 var scan_prefixes: Array = []  # networks to scan; empty means this computer's own
-var tray: StatusIndicator  # null when the app quits on close (not Windows, or run inside the editor)
+var tray: StatusIndicator  # null when the app quits on close (not Windows, or run from the editor)
 var instance_server: TCPServer  # null when running inside the editor
 var instance_peers: Array[StreamPeerTCP] = []  # later copies asking us to show
 
@@ -162,7 +162,9 @@ func _process(_delta: float) -> void:
 ## then only hides it: clicking the icon brings it back, right-clicking it
 ## offers Show and Quit.
 func _setup_tray() -> void:
-	if OS.get_name() != "Windows" or Engine.is_embedded_in_editor() \
+	# Not when run from the editor: its Stop button kills the app outright, which
+	# leaves a dead icon behind in the tray every time.
+	if OS.get_name() != "Windows" or OS.has_feature("editor") \
 			or not DisplayServer.has_feature(DisplayServer.FEATURE_STATUS_INDICATOR):
 		return
 	get_tree().set_auto_accept_quit(false)
@@ -188,7 +190,17 @@ func _on_tray_menu(id: int) -> void:
 	if id == 0:
 		_show_window()
 	else:
-		get_tree().quit()
+		_quit()
+
+
+## Takes the icon out of the tray before quitting, so none is left behind.
+func _quit() -> void:
+	if tray:
+		tray.visible = false
+		tray.queue_free()
+		tray = null
+		await get_tree().process_frame
+	get_tree().quit()
 
 
 func _notification(what: int) -> void:
